@@ -1,0 +1,55 @@
+---
+
+- name: 'Installing "/usr/sbin/mysqlxtra-remote"'
+  template: src="usr/sbin/mysqlxtra-server" dest="/usr/sbin/mysqlxtra-server" owner=root group=root mode=0755
+  tags: [ mysqlxtra, configs ]
+
+- name: 'Installing "/usr/sbin/mysqlxtra"'
+  template: src=usr/sbin/mysqlxtra dest=/usr/sbin/mysqlxtra owner=root group=root mode=0755
+  tags: [ mysqlxtra, configs ]
+
+- name: systemd
+  when: 
+    - ansible_service_mgr in 'systemd'
+    - not mysql_xtra_service_disabled
+  tags: [ mysqlxtra, packages, configs ]
+  block:
+
+    - name: 'Installing systemd mysqlxtra-server service'
+      template: src=etc/systemd/system/mysqlxtra-server.service dest=/etc/systemd/system/mysqlxtra-server.service mode=644 force=yes
+      register: _systemd_xtra
+
+    - name: 'Enabling mysqlxtra-server service'
+      systemd:
+        name: mysqlxtra-server
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
+        masked: no
+      when: _systemd_xtra.changed
+
+    - name: 'Starting mysqlxtra-server service'
+      systemd:
+        name: mysqlxtra-server
+        state: started
+
+- name: upstart
+  when: 
+    - ansible_service_mgr == 'upstart'
+    - not mysql_xtra_service_disabled
+  tags: [ mysqlxtra, packages, configs ]
+  block:
+
+    - name: 'copying mysqlxtra-server init.d script'
+      template: src=etc/init.d/mysqlxtra-server dest=/etc/init.d/mysqlxtra-server mode=755 force=yes
+      register: _systemd_xtra
+
+    - name: 'enabling mysqlxtra-server service'
+      shell: "update-rc.d mysqlxtra-server defaults || true"
+      changed_when: False
+
+    - name: 'Starting mysqlxtra-server service'
+      service:
+        name: mysqlxtra-server
+        state: restarted
+      when: _systemd_xtra.changed

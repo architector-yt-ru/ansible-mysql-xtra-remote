@@ -1,0 +1,212 @@
+#!/bin/bash
+
+{% raw %}
+
+DEBUG=/var/log/mysqlxtra-server.debug
+
+exec 19> ${DEBUG}
+export BASH_XTRACEFD="19"
+set -x
+set -f
+set -o pipefail
+
+ulimit -n 1000000
+
+BACKUP_PARALLEL=2
+MAX_HTTP_POST_LENGTH=2000000
+HTTP_RESP_CODE="200 OK"
+HTTP_RESP_BODY=""
+HTTP_CONTENT_LENGTH=0
+DB_EXCLUDE='"sys","mysql","information_schema","performance_schema"'
+
+http_response_json () {
+  echo "HTTP/1.0 ${1}"
+  echo "Content-Type: application/json; charset=utf-8"
+  echo "Connection: close"
+  echo
+  echo "${2}"
+}
+
+mysql_check_running () {
+  if [ $(mysqladmin --defaults-file=${1} ping 2>/dev/null | grep alive | wc -l) -ne 1 ] ; then 
+    http_response_json '503 Service Unavailable' '{"error": "Mysql server not running! ('${1}')!"}' && exit 1
+  fi
+}
+
+mysql_get_config () {
+  if [ -f "${1}" ]; then
+    mysql_check_running "${1}" || exit 1
+    echo "${1}" && exit 0
+  fi
+  for MYSQL_CONFIG in $(find /etc/mysql-multi/ /etc/my.cnf /etc/mysql/my.cnf -name "${1}.cnf" -readable 2>&- | sort); do
+    mysql_check_running "${MYSQL_CONFIG}" || exit 1
+    echo "${MYSQL_CONFIG}" && exit 0
+  done
+  http_response_json '404 Not Found' '{"error": "Mysql config not found ('${1}')!"}' && exit 1
+}
+
+while read -t 0.01 line; do
+  line=${line//$'\r'}
+  echo "${line}" >> ${DEBUG}
+  if [ -z "$line" ]; then break; fi
+  if echo "${line}" | grep -qi "^GET\|POST\|PUT\|DELETE"; then
+    # GET /test123?r=123 HTTP/1.1
+    export HTTP_REQUEST="${line}"
+    export HTTP_REQ_METHOD="$(echo "${line}"|cut -d" " -f 1)"
+    export HTTP_REQ_URI="$(echo "${line}"|cut -d" " -f 2)"
+    export HTTP_REQ_URI_PATH="$(echo "${HTTP_REQ_URI}"|cut -d"?" -f 1)"
+    if echo "$HTTP_REQ_URI"|grep -q '?'; then
+      export HTTP_REQ_URI_PARAMS="$(echo "${HTTP_REQ_URI}"|cut -d"?" -f 2-)"
+    else
+      export HTTP_REQ_URI_PARAMS=""
+    fi
+    export HTTP_REQ_VERSION="$(echo "${line}"|cut -d" " -f 3-)"
+  elif echo "${line}" | grep -qi "^User-Agent:"; then
+    export HTTP_USER_AGENT="$(echo "${line}"|cut -d" " -f 2-)"
+  elif echo "${line}" | grep -qi "^Host:"; then
+    export HTTP_HOST="$(echo "${line}"|cut -d" " -f 2-)"
+  elif echo "${line}" | grep -qi "^Accept-Encoding:"; then
+    export HTTP_ACCEPT_ENCODING="$(echo "${line}"|cut -d" " -f 2-)"
+  elif echo "${line}" | grep -qi "^Content-Length:"; then
+    export HTTP_CONTENT_LENGTH="$(echo "${line}"|cut -d" " -f 2-)"
+  elif [ ${#line} -ge 1 ]; then
+    # <any header>
+    continue
+  else
+    break
+  fi
+done
+
+if [ "${HTTP_REQ_METHOD}" == "POST" ] && [ ${HTTP_CONTENT_LENGTH} -ge 1 ]; then
+  export HTTP_POST_CONTENT=""
+  DATA_LENGTH=$HTTP_CONTENT_LENGTH
+  if [ ${DATA_LENGTH} -gt ${MAX_HTTP_POST_LENGTH} ]; then
+    http_response_json '413 Payload Too Large' '{"error": "MAX_HTTP_POST_LENGTH='${MAX_HTTP_POST_LENGTH}'"}'
+    # DATA_LENGTH=${MAX_HTTP_POST_LENGTH}
+  fi
+  READ_BUFFER_LENGTH=${DATA_LENGTH}
+  # Read POST data via standard input
+  while IFS= read -N $READ_BUFFER_LENGTH -r -t 1 post_buffer; do
+    let "DATA_LENGTH = DATA_LENGTH - READ_BUFFER_LENGTH"
+    HTTP_POST_CONTENT="${HTTP_POST_CONTENT}${post_buffer}"
+    # Stop reading if we reach the content length, max length, or expected length
+    if [ ${#HTTP_POST_CONTENT} -ge ${HTTP_CONTENT_LENGTH} ]; then
+      break;
+    elif [ ${#HTTP_POST_CONTENT} -ge ${MAX_HTTP_POST_LENGTH} ]; then
+      break;
+    elif [ ${DATA_LENGTH} -le 0 ]; then
+      break;
+    fi
+  done
+fi
+
+case "${HTTP_REQ_URI_PATH}" in
+  '/show-servers')
+    for MYSQL_CONFIG in $(find /etc/mysql-multi/ /etc/my.cnf /etc/mysql/my.cnf -name "*.cnf" -readable 2>&- | sort); do
+      RUNNING=`mysqladmin --defaults-file=${MYSQL_CONFIG} ping 2>/dev/null | grep alive | wc -l`
+      if [ $RUNNING -eq 1 ] ; then 
+        CONFIGS="${CONFIGS}${MYSQL_CONFIG}|"
+        PORTS="${PORTS}${MYSQL_CONFIG}="$(mysql --defaults-file=${MYSQL_CONFIG} -Ne "select concat(@@bind_address, ':', @@port)")"|"
+      fi
+    done
+    # HTTP_RESP_BODY=$(echo -n ${CONFIGS} | jq -R -s '. | split("|") | map(select(length > 0)) | {instances: .} ')
+    HTTP_RESP_BODY=$(echo -n ${CONFIGS} | tr "|" "\n" | jq -R '. | select(length > 0)' | jq -s '. | { instances: .}') # jq v.1.3
+    ;;
+
+  '/show-server-info')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    HTTP_RESP_BODY=$(mysql --defaults-file=${MYSQL_CONFIG} -Ee 'select @@port, @@version'| sed -re 's/^[ \@]*//;/^\*./d;s/^(.*)$/{"\1"}/;s/: /":"/' | jq -s add) 
+    ;;
+
+  '/show-databases')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    DATABASES=$(mysql --defaults-file=${MYSQL_CONFIG} -sNe "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN (${DB_EXCLUDE})")
+    HTTP_RESP_BODY=$(echo -n "${DATABASES}" | jq -R '.' | jq -s '. | {databases: .}') # jq v.1.3
+    ;;
+  '/show-tables')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    if [ "${HTTP_REQ_METHOD}" == "POST" ] && [ ${HTTP_CONTENT_LENGTH} -ge 1 ]; then
+      STRICT=$(echo "${HTTP_POST_CONTENT}" | grep -m1 -P '[^\w\d_$%.#-]')
+      if [ "${STRICT}" ]; then
+        http_response_json '400 Bad Request' '{"error": "Invalid table name ('${STRICT}')!"}'
+      else
+        for TABLE in ${HTTP_POST_CONTENT}; do
+          QUERY='SELECT CONCAT('\''{"name":"'\'', table_schema, '\''.'\'', table_name, '\''", "format":"'\'', row_format, '\''", "options":"'\'', CREATE_OPTIONS, '\''"}'\'') json FROM `information_schema`.`tables` WHERE CONCAT(`table_schema`, ".", `table_name`) like "'${TABLE}'" and `engine` = "innodb" and table_schema not in ('${DB_EXCLUDE}')' 
+          TABLES=${TABLES}$(mysql --defaults-file=${MYSQL_CONFIG} -sNe "${QUERY}")
+        done
+        HTTP_RESP_BODY=$(echo -n "${TABLES}" | jq '. | select(length > 0)' | jq -s '. | {tables: .}') # jq v.1.3
+      fi
+    fi
+    ;;
+  '/show-create-table')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    if [ "${HTTP_REQ_METHOD}" == "POST" ] && [ ${HTTP_CONTENT_LENGTH} -ge 1 ]; then
+      STRICT=$(echo "${HTTP_POST_CONTENT}" | grep -m1 -P '[^\w\d_$%.#- ]')
+      if [ "${STRICT}" ]; then
+        http_response_json '400 Bad Request' '{"error": "Invalid table name ('${STRICT}')!"}' && exit 1
+      else
+        DB=`echo ${HTTP_POST_CONTENT} | cut -d. -f1`
+        TBL=`echo ${HTTP_POST_CONTENT} | cut -d. -f2`
+        mysqldump \
+            --defaults-file=${MYSQL_CONFIG} \
+            --single-transaction \
+            --all-databases=0 \
+            --apply-slave-statements=0 \
+            --master-data=0 \
+            --no-data \
+            --triggers \
+            --routines=0 \
+            ${DB} ${TBL}
+        exit 0
+      fi
+    fi
+    ;;
+  '/dump')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    if [ "${HTTP_ACCEPT_ENCODING}" == "identity" ]; then
+      xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+        2>>/var/log/mysql/xtrabackup.log
+    else
+      xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+        2>>/var/log/mysql/xtrabackup.log | pigz -c --fast
+    fi
+    exit 0
+    ;;
+
+  '/dump-databases')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    if [ "${HTTP_REQ_METHOD}" == "POST" ] && [ ${HTTP_CONTENT_LENGTH} -ge 1 ]; then
+      echo -n "${HTTP_POST_CONTENT}" > /tmp/xtra.databases.$$
+      if [ "${HTTP_ACCEPT_ENCODING}" == "identity" ]; then
+        xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+          --databases-file=/tmp/xtra.databases.$$ 2>>/var/log/mysql/xtrabackup.log
+      else
+        xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+          --databases-file=/tmp/xtra.databases.$$ 2>>/var/log/mysql/xtrabackup.log | pigz -c --fast
+      fi
+      exit 0
+    fi
+    ;;
+
+  '/dump-tables')
+    MYSQL_CONFIG=$(mysql_get_config "$HTTP_REQ_URI_PARAMS") || exit 1
+    if [ "${HTTP_REQ_METHOD}" == "POST" ] && [ ${HTTP_CONTENT_LENGTH} -ge 1 ]; then
+      echo -n "${HTTP_POST_CONTENT}" > /tmp/xtra.tables.$$
+      if [ "${HTTP_ACCEPT_ENCODING}" == "identity" ]; then
+        xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+          --tables-file=/tmp/xtra.tables.$$ 2>>/var/log/mysql/xtrabackup.log
+      else
+        xtrabackup --defaults-file="${MYSQL_CONFIG}" --parallel=${BACKUP_PARALLEL} --stream=xbstream --slave-info --backup \
+          --tables-file=/tmp/xtra.tables.$$ 2>>/var/log/mysql/xtrabackup.log | pigz -c --fast
+      fi
+      exit 0
+    fi
+    ;;
+  *) 
+    http_response_json '405 Method Not Allowed' '{"error": "Unknown command!"}' && exit 1
+    ;;
+esac
+
+http_response_json "${HTTP_RESP_CODE}" "${HTTP_RESP_BODY}" && exit 0
+
+{% endraw %}

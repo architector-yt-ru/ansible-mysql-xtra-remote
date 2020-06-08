@@ -1,0 +1,35 @@
+---
+
+- name: 'installing packages'
+  apt: 
+    state: present 
+    update_cache: yes 
+    cache_valid_time: 3600
+    name:
+      - "{{ mysql_xtrabackup_package }}"
+      - pigz
+      - socat
+      - jq
+  register: _install_software
+  until: _install_software is succeeded
+  retries: 3
+  when: ansible_os_family == "Debian"
+  tags: [ mysqlxtra, packages, apt ]
+
+- name: 'installing packages'
+  yum: 
+    state: present # update_cache=yes
+    name:
+      - "{{ mysql_xtrabackup_package }}"
+      - pigz
+      - socat
+      - jq
+  register: _install_software
+  until: _install_software is succeeded
+  retries: 3
+  when: ansible_os_family == "RedHat"
+  tags: [ mysqlxtra, packages, yum ]
+
+- name: match instance
+  include: xtra-remote.yml 
+
