@@ -35,14 +35,14 @@ database_rename () { # Renaming destination database
   echo ${DB}
 }
 
-xtrabackup () {
+get_xtrabackup () {
   local DUMP_MODE=${1}
   local XTRA_URL="http://${MYSQL_XTRA_HOST}:${MYSQL_XTRA_PORT}/${DUMP_MODE}?${MYSQL_REMOTE_CONFIG}"
   local C_OPTS=""
   local X_OPTS=""
 
   if [ "${DUMP_MODE}" == "dump-tables" ]; then
-    C_OPTS="--data-binary \"@${TABLES_LIST}\""
+    C_OPTS="--data-binary @${TABLES_LIST}"
     X_OPTS="--export"
   fi
 
@@ -208,7 +208,7 @@ if [ "${ALL}" = true ]; then
   # fi
 
 
-  $(xtrabackup "dump") || exit
+  $(get_xtrabackup "dump") || exit
 
   if [ ${ARCHIVE} = true ] ; then
     # Renaming destination database
@@ -353,7 +353,7 @@ else # ALL
 
   wait
 
-  $(xtrabackup "dump-tables") || exit
+  $(get_xtrabackup "dump-tables") || exit
 
   # date +"[%F %T] Get remote xtrabackup ..." 
 
