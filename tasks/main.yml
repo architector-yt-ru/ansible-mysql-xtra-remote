@@ -10,6 +10,7 @@
       - pigz
       - socat
       - jq
+      - curl
   register: _install_software
   until: _install_software is succeeded
   retries: 3
@@ -24,6 +25,7 @@
       - pigz
       - socat
       - jq
+      - curl
   register: _install_software
   until: _install_software is succeeded
   retries: 3
